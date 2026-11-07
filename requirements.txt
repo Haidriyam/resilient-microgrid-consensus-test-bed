@@ -1,0 +1,11 @@
+# Core Scientific & Numerical Stack
+numpy>=1.24.0,<2.0.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+
+# Code Quality & Static Analysis
+flake8>=6.0.0
+bandit>=1.7.5
+
+# Test & Verification Harness
+pytest>=7.3.0
