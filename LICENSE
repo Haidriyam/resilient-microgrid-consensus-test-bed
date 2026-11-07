@@ -1,1 +1,1 @@
-
+<FollowUp label="Would you like me to generate the automated pytest suite (test_convergence.py) for the tests/ directory?" query="Generate the automated pytest test suite test_convergence.py asserting numerical tolerances, convergence, and security constraints."/>
