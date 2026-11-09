@@ -1,101 +1,58 @@
 #!/usr/bin/env python3
 """
-Automated Test Suite for AMD-BC Microgrid Consensus Verification
-Asserts numerical stability, convergence bounds, and attack isolation.
+Automated Pytest Suite for AMD-BC Consensus Verification.
+Tests numerical stability, convergence bounds, and attack isolation properties.
 """
 
 import numpy as np
 import pytest
-from scipy.integrate import solve_ivp
-
-# System parameters under test
-N_DGS = 4
-F_NOMINAL = 50.0
-OMEGA_0 = 2.0 * np.pi * F_NOMINAL
-M_DROOP = np.array([2.5e-4, 3.33e-4, 5.0e-4, 2.5e-4])
-TAU_P = np.array([0.08, 0.08, 0.10, 0.08])
-P_BASE = np.array([60e3, 45e3, 30e3, 60e3])
-PINNING = np.array([1.5, 0.0, 0.0, 0.0])
-ADJ = np.array([
-    [0.0, 0.0, 1.0, 1.0],
-    [1.0, 0.0, 0.0, 0.0],
-    [1.0, 1.0, 0.0, 0.0],
-    [0.0, 0.0, 1.0, 0.0]
-])
+from run_simulation import (
+    N_DG,
+    F_NOM,
+    run_simulation,
+    compute_metrics,
+    verify_nominal_stability,
+    calculate_amdbc_weights
+)
 
 
-def dynamic_model(t, state, enable_resilience, fdi_magnitude):
-    P = state[0:N_DGS]
-    u = state[N_DGS:2 * N_DGS]
-    omega_inst = OMEGA_0 - M_DROOP * P + u
-
-    # Injected measurement bias on Node 2 (Index 1)
-    omega_tx = omega_inst.copy()
-    if 5.0 <= t <= 15.0:
-        omega_tx[1] += fdi_magnitude
-
-    dP = (P_BASE - P) / TAU_P
-    du = np.zeros(N_DGS)
-
-    for i in range(N_DGS):
-        nbrs = np.where(ADJ[i] > 0)[0]
-        consensus = 0.0
-
-        if not enable_resilience:
-            for j in nbrs:
-                consensus += ADJ[i, j] * (omega_tx[j] - omega_inst[i])
-        else:
-            cluster = np.array([omega_inst[i]] + [omega_tx[j] for j in nbrs])
-            med = np.median(cluster)
-            mad = np.median(np.abs(cluster - med))
-            sigma = 1.4826 * mad + 1e-4
-
-            for j in nbrs:
-                dev = np.abs(omega_tx[j] - med)
-                w_ij = np.exp(-0.5 * ((dev / (2.5 * sigma)) ** 4))
-                consensus += (w_ij * ADJ[i, j]) * (omega_tx[j] - omega_inst[i])
-
-        pinning_err = PINNING[i] * (OMEGA_0 - omega_inst[i])
-        du[i] = 7.5 * (consensus + pinning_err)
-
-    d_omega = -M_DROOP * dP + du
-    return np.concatenate([dP, du, d_omega])
+def test_nominal_stability_modulo_phase():
+    """Verify that nominal model has 1 neutral rotational mode and is exponentially stable."""
+    neutral_modes, max_real_ev = verify_nominal_stability()
+    assert neutral_modes == 1, f"Expected exactly 1 neutral mode, found {neutral_modes}"
+    assert max_real_ev < -0.1, f"Expected stable real parts (< -0.1), found {max_real_ev}"
 
 
-@pytest.fixture
-def initial_state():
-    P0 = P_BASE.copy()
-    u0 = np.zeros(N_DGS)
-    omega0 = OMEGA_0 - M_DROOP * P0
-    return np.concatenate([P0, u0, omega0])
+def test_weight_attenuation_on_extreme_outlier():
+    """Verify that MAD soft-saturating kernel completely isolates severe outliers."""
+    local_val = 0.0
+    # Clean cluster around 0.0, with one malicious outlier at 0.35 rad/s
+    neighbor_vals = np.array([0.001, -0.002, 0.35])
+    weights = calculate_amdbc_weights(local_val, neighbor_vals)
+    
+    # DG 3 (the outlier) weight must decay to less than 1e-10
+    assert weights[2] < 1e-10, f"Expected weight to decay to < 1e-10, got {weights[2]}"
+    # Benign neighbors must retain near-unity weights
+    assert weights[0] > 0.95
+    assert weights[1] > 0.95
 
 
-def test_standard_consensus_fails_under_fdi(initial_state):
-    """Assert standard linear consensus trips grid frequency limits under FDI."""
-    sol = solve_ivp(
-        dynamic_model, (0.0, 10.0), initial_state,
-        args=(False, 1.8 * 2 * np.pi), method="RK45", rtol=1e-5
+def test_standard_consensus_fails_under_ramp_attack():
+    """Verify that unshielded consensus breaches under-frequency relay threshold (49.5 Hz)."""
+    res = run_simulation(method="standard", attack_type="ramp", seed=42)
+    metrics = compute_metrics(res)
+    assert metrics["Frequency Nadir (Hz)"] < 49.50, (
+        f"Standard consensus unexpectedly passed: nadir = {metrics['Frequency Nadir (Hz)']}"
     )
-    # Check frequency at t = 10s (under attack)
-    f_final = sol.y[2 * N_DGS:3 * N_DGS, -1] / (2 * np.pi)
-    # Authentic nodes should drop below 49.5 Hz (trip threshold)
-    assert np.any(f_final < 49.5), "Standard consensus unexpectedly survived attack"
 
 
-def test_amdbc_restores_nominal_frequency(initial_state):
-    """Assert proposed AMD-BC restores frequency to 50 Hz within +/- 0.05 Hz."""
-    sol = solve_ivp(
-        dynamic_model, (0.0, 10.0), initial_state,
-        args=(True, 1.8 * 2 * np.pi), method="RK45", rtol=1e-5
+def test_amdbc_restores_nominal_frequency():
+    """Verify that AMD-BC keeps frequency tightly regulated above 49.95 Hz during attack."""
+    res = run_simulation(method="amdbc", attack_type="ramp", seed=42)
+    metrics = compute_metrics(res)
+    assert metrics["Frequency Nadir (Hz)"] >= 49.95, (
+        f"AMD-BC failed nadir requirement: nadir = {metrics['Frequency Nadir (Hz)']}"
     )
-    f_final = sol.y[2 * N_DGS:3 * N_DGS, -1] / (2 * np.pi)
-    # Every node must be tightly held within safe statutory tolerance
-    np.testing.assert_allclose(f_final, 50.0, atol=0.05)
-
-
-def test_weight_attenuation_property():
-    """Assert soft-saturation weight approaches zero for extreme outliers."""
-    dev = 1.8 * 2 * np.pi
-    sigma = 0.05
-    w = np.exp(-0.5 * ((dev / (2.5 * sigma)) ** 4))
-    assert w < 1e-15, f"Weight did not attenuate properly: {w}"
+    assert metrics["Attack Window Dev (Hz)"] < 0.05, (
+        f"AMD-BC exceeded attack window limit: dev = {metrics['Attack Window Dev (Hz)']}"
+    )
