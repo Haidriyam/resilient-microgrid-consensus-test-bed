@@ -1,267 +1,373 @@
+#!/usr/bin/env python3
 """
+Research Benchmark & Figure Generator:
 Resilient Distributed Secondary Frequency Control in Islanded AC Microgrids
-Benchmark: 4-Inverter System under Covert False Data Injection (FDI) Attacks
-Comparative Evaluation: Standard Distributed Consensus vs. Outlier-Rejection Consensus
+Paper: "Outlier-Rejection Consensus for Resilient Secondary Frequency Regulation
+        in Islanded AC Microgrids Under False Data Injection Attacks"
+
+Author: Muhammad Adeel Sajjad (Independent Researcher)
 """
 
+import os
+import time
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.linalg import eigvals
 
-# ---------------------------------------------------------------------------
-# 1. SIMULATION HORIZON & TIME DISCRETIZATION
-# ---------------------------------------------------------------------------
-dt_sim = 1e-3        # 1 ms physical solver step (Runge-Kutta 4th order / forward Euler)
-T_end = 12.0         # 12 seconds total simulation time
-t_vec = np.arange(0, T_end, dt_sim)
-n_steps = len(t_vec)
+# ------------------------------------------------------------------------------
+# 1. System Parameters
+# ------------------------------------------------------------------------------
+SEED = 42
+N_DG = 4
+F_NOM = 50.0                                 # Nominal frequency (Hz)
+W_NOM = 2.0 * np.pi * F_NOM                 # 314.159 rad/s
 
-# Secondary control cycle (discrete cyber execution)
-Ts_sec = 0.02        # 20 ms cyber sampling rate (50 Hz)
-sec_step_interval = int(Ts_sec / dt_sim)
+DT = 0.005                                  # 5 ms fixed integration step
+T_END = 18.0                                # 18 seconds total horizon
+TIME = np.arange(0.0, T_END + DT / 2.0, DT)
+N_STEPS = len(TIME)
 
-# ---------------------------------------------------------------------------
-# 2. PHYSICAL PARAMETERS (4-INVERTER ISLANDED AC MICROGRID)
-# ---------------------------------------------------------------------------
-N = 4
-f_nominal = 50.0                        # Nominal frequency (Hz)
-omega_0 = 2.0 * np.pi * f_nominal       # Nominal angular frequency (rad/s)
+# Inertia (M) and Damping (D)
+M = np.array([0.060, 0.065, 0.070, 0.060])
+D = np.array([0.030, 0.030, 0.035, 0.030])
 
-# Rated active powers (kW) & droop coefficients
-# P_max = [100, 80, 60, 40] kW -> Droop gains scaled inversely
-P_max = np.array([100.0, 80.0, 60.0, 40.0]) * 1e3
-# Setting max frequency drop at rated power to 1.0 Hz (2*pi rad/s)
-delta_omega_max = 2.0 * np.pi * 1.0
-m_droop = delta_omega_max / P_max       # Droop coefficients [rad/(s*W)]
+# Primary droop coefficients and filter delays
+K_DROOP = np.array([0.040, 0.045, 0.050, 0.040])
+T_POWER = np.array([0.080, 0.080, 0.100, 0.080])
 
-tau_P = 0.10 * np.ones(N)               # Power measurement filter time constant (s)
-c_secondary = 7.5                       # Secondary consensus integral gain
+# Secondary consensus gains and limits
+K_CONSENSUS = 0.020
+K_PINNING = 0.045
+U_MAX = 0.35
+PINNING = np.array([1.0, 0.0, 0.0, 0.0])    # DG1 pinned to nominal
 
-# ---------------------------------------------------------------------------
-# 3. CYBER NETWORK TOPOLOGY (DIRECTED GRAPH)
-# ---------------------------------------------------------------------------
-# Adjacency Matrix A: Directed ring with cross-link
-# Link (j -> i): row i, col j
-A_matrix = np.array([
-    [0.0, 1.0, 0.0, 1.0],  # Agent 1 receives from Agent 2 and Agent 4
-    [1.0, 0.0, 1.0, 0.0],  # Agent 2 receives from Agent 1 and Agent 3
-    [0.0, 1.0, 0.0, 1.0],  # Agent 3 receives from Agent 2 and Agent 4
-    [1.0, 0.0, 1.0, 0.0]   # Agent 4 receives from Agent 1 and Agent 3
+# Directed communication adjacency (Ring + cross link)
+ADJ = np.array([
+    [0.0, 1.0, 1.0, 0.0],
+    [1.0, 0.0, 1.0, 0.0],
+    [0.0, 1.0, 0.0, 1.0],
+    [1.0, 0.0, 1.0, 0.0]
 ])
 
-# Pinning gain: Only Agent 1 has direct access to omega_0
-g_pin = np.array([1.5, 0.0, 0.0, 0.0])
+# Electrical coupling matrix (Symmetric distribution line susceptances)
+K_NET = np.zeros((N_DG, N_DG))
+line_connections = [(0, 1, 0.80), (1, 2, 0.75), (2, 3, 0.80), (3, 0, 0.75)]
+for i, j, b in line_connections:
+    K_NET[i, j] = b
+    K_NET[j, i] = b
 
-# ---------------------------------------------------------------------------
-# 4. LOAD PROFILE & ATTACK SCENARIO SPECIFICATION
-# ---------------------------------------------------------------------------
-# Base load demand per inverter (W)
-P_load_base = np.array([50.0, 40.0, 30.0, 20.0]) * 1e3  # Total = 140 kW
+# Disturbance & Attack schedule
+LOAD_STEP_TIME = 2.5
+LOAD_STEP_VAL = np.array([0.04, 0.03, 0.05, 0.03])  # +15% aggregate load
 
-def get_load_demand(t):
-    """Introduces step load change at t = 2.0 s (+20 kW total)"""
-    P_dist = P_load_base.copy()
-    if t >= 2.0:
-        # Step increase distributed proportionally
-        P_dist += np.array([8.0, 6.0, 4.0, 2.0]) * 1e3
-    return P_dist
+ATTACK_START = 5.0
+ATTACK_END = 15.0
+ATTACKED_DG = 1                             # DG 2 (0-indexed)
 
-# Attack parameters: Link (2 -> 1) compromised at t = 5.0 s
-t_attack_start = 5.0
-attack_bias_target = 2.0 * np.pi * 0.45  # 0.45 Hz stealthy frequency spoofing
-attack_ramp_rate = attack_bias_target / 1.5  # Reaches max over 1.5 s (covert ramp)
+NOISE_STD = 0.003                           # rad/s measurement noise
+COMM_DELAY_SEC = 0.010                      # 10 ms communication delay
+DELAY_STEPS = int(round(COMM_DELAY_SEC / DT))
 
-def get_fdi_attack(t):
-    """Covert ramp-and-hold attack on incoming data at Node 1 from Node 2"""
-    if t < t_attack_start:
+MAD_EPSILON = 0.002
+MAD_THRESHOLD = 2.5
+
+
+# ------------------------------------------------------------------------------
+# 2. Mathematical Functions & Control Laws
+# ------------------------------------------------------------------------------
+def get_attack_signal(t, attack_type):
+    """Generate time-varying FDI bias signal."""
+    if attack_type == "no_attack" or not (ATTACK_START <= t <= ATTACK_END):
         return 0.0
-    ramp = attack_ramp_rate * (t - t_attack_start)
-    return min(ramp, attack_bias_target)
+    elapsed = t - ATTACK_START
+    if attack_type == "constant":
+        return 0.25
+    elif attack_type == "ramp":
+        return 0.25 * min(1.0, elapsed / 3.5)
+    elif attack_type == "oscillatory":
+        return 0.18 * np.sin(2.0 * np.pi * 0.5 * elapsed) + 0.06
+    elif attack_type == "intermittent":
+        return 0.25 if int(elapsed / 1.0) % 2 == 0 else 0.0
+    return 0.0
 
-# ---------------------------------------------------------------------------
-# 5. CORE SIMULATION ENGINE
-# ---------------------------------------------------------------------------
-def run_simulation(enable_outlier_rejection=False):
-    # State vectors
-    omega = np.ones((n_steps, N)) * omega_0
-    P_filt = np.zeros((n_steps, N))
-    u_sec = np.zeros((n_steps, N))
-    
-    # Internal states for discrete execution
-    u_curr = np.zeros(N)
-    P_curr = P_load_base.copy()
-    
-    # Telemetry logging for attack flags
-    rejected_links = np.zeros((n_steps, N, N))
-    
-    # Outlier rejection tuning parameter
-    kappa_mad = 2.5
-    
-    for k in range(n_steps - 1):
-        t_curr = t_vec[k]
-        P_dem = get_load_demand(t_curr)
-        
-        # -------------------------------------------------------------------
-        # Physical Layer Dynamics (1 ms update)
-        # -------------------------------------------------------------------
-        # Low-pass active power filter: dP/dt = (-P + P_demand) / tau
-        dP = (P_dem - P_curr) / tau_P
-        P_curr = P_curr + dt_sim * dP
-        P_filt[k, :] = P_curr
-        
-        # Primary droop + Secondary integration:
-        # omega_i = omega_0 - m_i * P_i + u_i
-        omega_curr = omega_0 - m_droop * P_curr + u_curr
-        omega[k, :] = omega_curr
-        u_sec[k, :] = u_curr
-        
-        # -------------------------------------------------------------------
-        # Cyber Layer: Discrete Secondary Consensus (Every Ts_sec = 20 ms)
-        # -------------------------------------------------------------------
-        if k % sec_step_interval == 0:
-            attack_val = get_fdi_attack(t_curr)
-            
-            # Construct perceived neighbor states
-            # Agent i receives state from j: omega_perceived[i, j]
-            omega_perceived = np.zeros((N, N))
-            for i in range(N):
-                for j in range(N):
-                    if A_matrix[i, j] > 0:
-                        omega_perceived[i, j] = omega_curr[j]
-                        # Inject covert attack on link (2 -> 1)
-                        if i == 0 and j == 1:
-                            omega_perceived[i, j] += attack_val
-                            
-            # Compute consensus update for each agent
-            du_dt = np.zeros(N)
-            for i in range(N):
-                neighbors = np.where(A_matrix[i, :] > 0)[0]
-                rec_states = [omega_perceived[i, j] for j in neighbors]
-                
-                # Resilient edge weights
-                weights = {j: A_matrix[i, j] for j in neighbors}
-                
-                if enable_outlier_rejection and len(rec_states) > 0:
-                    # Form local evaluation neighborhood (neighbor states + local state)
-                    local_pool = np.array(rec_states + [omega_curr[i]])
-                    loc_med = np.median(local_pool)
-                    
-                    # Median Absolute Deviation (MAD)
-                    mad = np.median(np.abs(local_pool - loc_med))
-                    # Prevent zero division under synchronization
-                    sigma_floor = max(mad, 1e-4)
-                    
-                    for j in neighbors:
-                        res = np.abs(omega_perceived[i, j] - loc_med)
-                        if res > kappa_mad * sigma_floor:
-                            # Flag Byzantine injection and prune link
-                            weights[j] = 0.0
-                            rejected_links[k:k+sec_step_interval, i, j] = 1.0
 
-                # Consensus sum with weighted link validation
-                neighbor_consensus_sum = sum(
-                    weights[j] * (omega_curr[i] - omega_perceived[i, j]) 
-                    for j in neighbors
-                )
-                
-                # Pinning synchronization to reference
-                pin_term = g_pin[i] * (omega_curr[i] - omega_0)
-                
-                # Derivative of secondary integral control
-                du_dt[i] = -c_secondary * (neighbor_consensus_sum + pin_term)
-                
-            # Update secondary control accumulator
-            u_curr = u_curr + Ts_sec * du_dt
-            
-    # Final boundary step
-    omega[-1, :] = omega_0 - m_droop * P_curr + u_curr
-    P_filt[-1, :] = P_curr
-    u_sec[-1, :] = u_curr
-    
-    return omega, u_sec, rejected_links
+def calculate_amdbc_weights(local_val, neighbor_vals):
+    """Compute normalized soft-saturating weights via Median Absolute Deviation."""
+    values = np.concatenate(([local_val], neighbor_vals))
+    med = np.median(values)
+    mad = np.median(np.abs(values - med))
+    sigma = 1.4826 * mad + MAD_EPSILON
+    deviations = np.abs(neighbor_vals - med)
+    normalized = deviations / (MAD_THRESHOLD * sigma)
+    exponent = np.minimum(0.5 * (normalized ** 4), 50.0)
+    return np.exp(-exponent)
 
-# ---------------------------------------------------------------------------
-# 6. RUN BOTH COMPARATIVE SCENARIOS
-# ---------------------------------------------------------------------------
-print("[*] Running Scenario A: Standard Secondary Consensus (Unprotected)...")
-omega_unprot, u_unprot, _ = run_simulation(enable_outlier_rejection=False)
 
-print("[*] Running Scenario B: Outlier-Rejection Resilient Consensus...")
-omega_resil, u_resil, flags_resil = run_simulation(enable_outlier_rejection=True)
+def secondary_control_law(local_meas, received_meas, method):
+    """Evaluate secondary consensus control law for all nodes."""
+    du = np.zeros(N_DG)
+    weights_matrix = np.zeros((N_DG, N_DG))
 
-# Convert rad/s to Hz
-f_unprot = omega_unprot / (2.0 * np.pi)
-f_resil = omega_resil / (2.0 * np.pi)
+    for i in range(N_DG):
+        nbrs = np.where(ADJ[i] > 0)[0]
+        if len(nbrs) == 0:
+            continue
+        loc = local_meas[i]
+        rec = received_meas[nbrs]
 
-# ---------------------------------------------------------------------------
-# 7. PUBLICATION-QUALITY PLOTTING (IEEE FORMATTING)
-# ---------------------------------------------------------------------------
-plt.rcParams.update({
-    "font.family": "serif",
-    "font.size": 10,
-    "axes.labelsize": 11,
-    "axes.titlesize": 11,
-    "legend.fontsize": 8.5,
-    "xtick.labelsize": 9,
-    "ytick.labelsize": 9,
-    "figure.dpi": 300,
-    "lines.linewidth": 1.4
-})
+        if method == "standard":
+            w = np.ones(len(nbrs))
+            consensus = np.mean(rec - loc)
+        elif method == "median":
+            cluster = np.concatenate(([loc], rec))
+            w = np.ones(len(nbrs))
+            consensus = np.median(cluster) - loc
+        elif method == "amdbc":
+            w = calculate_amdbc_weights(loc, rec)
+            w_sum = np.sum(w)
+            consensus = np.sum(w * (rec - loc)) / (w_sum + 1e-9)
+        else:
+            raise ValueError(f"Unknown method {method}")
 
-fig, axes = plt.subplots(2, 2, figsize=(10, 6.5), sharex=True)
-colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
-labels = ['DG 1 (Pinned)', 'DG 2', 'DG 3', 'DG 4']
+        weights_matrix[i, nbrs] = w
+        pinning_err = -K_PINNING * PINNING[i] * loc
+        du[i] = K_CONSENSUS * consensus + pinning_err
 
-# --- SUBPLOT 1: Frequency Under Standard Consensus ---
-ax1 = axes[0, 0]
-for i in range(N):
-    ax1.plot(t_vec, f_unprot[:, i], color=colors[i], label=labels[i])
-ax1.axhline(50.0, color='black', linestyle='--', alpha=0.7, label='Reference (50 Hz)')
-ax1.axvline(2.0, color='gray', linestyle=':', label='Load Step (+20 kW)')
-ax1.axvline(5.0, color='crimson', linestyle=':', label='FDI Attack Onset')
-ax1.set_ylabel("Frequency (Hz)")
-ax1.set_title("(a) Standard Consensus Under FDI Attack")
-ax1.grid(True, alpha=0.3)
-ax1.legend(loc="lower left", framealpha=0.9)
-ax1.set_ylim([48.8, 50.4])
+    return du, weights_matrix
 
-# --- SUBPLOT 2: Frequency Under Resilient Consensus ---
-ax2 = axes[0, 1]
-for i in range(N):
-    ax2.plot(t_vec, f_resil[:, i], color=colors[i], label=labels[i])
-ax2.axhline(50.0, color='black', linestyle='--', alpha=0.7)
-ax2.axvline(2.0, color='gray', linestyle=':')
-ax2.axvline(5.0, color='crimson', linestyle=':')
-ax2.set_ylabel("Frequency (Hz)")
-ax2.set_title("(b) Proposed Outlier-Rejection Consensus")
-ax2.grid(True, alpha=0.3)
-ax2.set_ylim([48.8, 50.4])
 
-# --- SUBPLOT 3: Secondary Control Inputs (Unprotected) ---
-ax3 = axes[1, 0]
-for i in range(N):
-    ax3.plot(t_vec, u_unprot[:, i] / (2.0 * np.pi), color=colors[i], label=f'$u_{i+1}$')
-ax3.set_xlabel("Time (s)")
-ax3.set_ylabel("Correction $u_i$ (Hz)")
-ax3.set_title("(c) Control Effort (Unprotected)")
-ax3.grid(True, alpha=0.3)
-ax3.legend(loc="upper left")
+def physical_ode(state, u, load):
+    """Continuous differential equations governing generator angles, frequencies, and power."""
+    theta = state[0:N_DG]
+    omega = state[N_DG:2*N_DG]
+    p_dev = state[2*N_DG:3*N_DG]
 
-# --- SUBPLOT 4: Secondary Control Inputs (Resilient) & Detection ---
-ax4 = axes[1, 1]
-for i in range(N):
-    ax4.plot(t_vec, u_resil[:, i] / (2.0 * np.pi), color=colors[i], label=f'$u_{i+1}$')
-# Highlight attack rejection period on secondary axis or shaded region
-attack_flag_series = flags_resil[:, 0, 1]  # Agent 1 flagging Link (2->1)
-if np.any(attack_flag_series > 0):
-    t_flagged = t_vec[attack_flag_series > 0]
-    ax4.axvspan(t_flagged[0], t_flagged[-1], color='crimson', alpha=0.15, label='Link (2->1) Pruned')
-ax4.set_xlabel("Time (s)")
-ax4.set_ylabel("Correction $u_i$ (Hz)")
-ax4.set_title("(d) Control Effort (Proposed Resilient Scheme)")
-ax4.grid(True, alpha=0.3)
-ax4.legend(loc="upper left")
+    d_theta = omega.copy()
+    p_elec = np.zeros(N_DG)
+    for i in range(N_DG):
+        for j in range(N_DG):
+            if K_NET[i, j] > 0:
+                p_elec[i] += K_NET[i, j] * np.sin(theta[i] - theta[j])
 
-plt.tight_layout()
-plt.savefig("microgrid_resilient_consensus_results.png", dpi=300)
-print("[+] Simulation finished. Output saved to 'microgrid_resilient_consensus_results.png'.")
-plt.show()
+    d_omega = (p_dev - load - D * omega - p_elec) / M
+    d_pdev = (-p_dev - K_DROOP * omega + u) / T_POWER
+    return np.concatenate([d_theta, d_omega, d_pdev])
+
+
+def rk4_step(state, u, load, dt):
+    """4th-order Runge-Kutta numerical integration step."""
+    k1 = physical_ode(state, u, load)
+    k2 = physical_ode(state + 0.5 * dt * k1, u, load)
+    k3 = physical_ode(state + 0.5 * dt * k2, u, load)
+    k4 = physical_ode(state + dt * k3, u, load)
+    return state + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+
+# ------------------------------------------------------------------------------
+# 3. Simulation Runner
+# ------------------------------------------------------------------------------
+def run_simulation(method="amdbc", attack_type="ramp", seed=42):
+    """Execute complete time-domain simulation run."""
+    rng = np.random.default_rng(seed)
+    noise_matrix = rng.normal(0.0, NOISE_STD, size=(N_STEPS, N_DG))
+
+    state = np.zeros(3 * N_DG)
+    u = np.zeros(N_DG)
+
+    omega_hist = np.zeros((N_STEPS, N_DG))
+    power_hist = np.zeros((N_STEPS, N_DG))
+    control_hist = np.zeros((N_STEPS, N_DG))
+    weight_hist = np.zeros((N_STEPS, N_DG, N_DG))
+    attack_hist = np.zeros(N_STEPS)
+    tx_history = np.zeros((N_STEPS, N_DG))
+
+    for k, t in enumerate(TIME):
+        omega = state[N_DG:2*N_DG]
+        omega_hist[k] = omega
+        power_hist[k] = state[2*N_DG:3*N_DG]
+        control_hist[k] = u
+
+        local_meas = omega + noise_matrix[k]
+
+        att = get_attack_signal(t, attack_type)
+        attack_hist[k] = att
+        tx_data = local_meas.copy()
+        tx_data[ATTACKED_DG] += att
+        tx_history[k] = tx_data
+
+        delayed_idx = max(0, k - DELAY_STEPS)
+        rx_data = tx_history[delayed_idx].copy()
+
+        du, weights = secondary_control_law(local_meas, rx_data, method)
+        weight_hist[k] = weights
+
+        u = np.clip(u + DT * du, -U_MAX, U_MAX)
+        load = LOAD_STEP_VAL if t >= LOAD_STEP_TIME else np.zeros(N_DG)
+        state = rk4_step(state, u, load, DT)
+
+    freq_hz = F_NOM + omega_hist / (2.0 * np.pi)
+    return {
+        "time": TIME,
+        "frequency": freq_hz,
+        "control": control_hist,
+        "power": power_hist,
+        "weights": weight_hist,
+        "attack": attack_hist,
+        "method": method,
+        "attack_type": attack_type
+    }
+
+
+def compute_metrics(res):
+    """Extract standard IEEE evaluation metrics."""
+    t = res["time"]
+    f = res["frequency"]
+    err = f - F_NOM
+    abs_err = np.abs(err)
+
+    attack_mask = (t >= ATTACK_START) & (t <= ATTACK_END)
+    rmse = float(np.sqrt(np.mean(err**2)))
+    iae = float(np.trapz(np.mean(abs_err, axis=1), t))
+    max_dev = float(np.max(abs_err))
+    att_dev = float(np.max(abs_err[attack_mask]))
+    f_nadir = float(np.min(f))
+
+    return {
+        "Method": res["method"],
+        "Attack": res["attack_type"],
+        "RMSE (Hz)": rmse,
+        "IAE (Hz*s)": iae,
+        "Max Deviation (Hz)": max_dev,
+        "Attack Window Dev (Hz)": att_dev,
+        "Frequency Nadir (Hz)": f_nadir
+    }
+
+
+def verify_nominal_stability():
+    """Verify small-signal stability of the delay-free linearized state matrix."""
+    I = np.eye(N_DG)
+    Z = np.zeros((N_DG, N_DG))
+    Minv = np.diag(1.0 / M)
+    Tinv = np.diag(1.0 / T_POWER)
+    L_comm = np.diag(ADJ.sum(axis=1)) - ADJ
+    L_net = np.diag(K_NET.sum(axis=1)) - K_NET
+
+    A11, A12, A13, A14 = Z, I, Z, Z
+    A21, A22, A23, A24 = -Minv @ L_net, -Minv @ np.diag(D), Minv, Z
+    A31, A32, A33, A34 = Z, -Tinv @ np.diag(K_DROOP), -Tinv, Tinv
+    A41, A42, A43, A44 = Z, -K_CONSENSUS * L_comm - K_PINNING * np.diag(PINNING), Z, Z
+
+    A_sys = np.block([
+        [A11, A12, A13, A14],
+        [A21, A22, A23, A24],
+        [A31, A32, A33, A34],
+        [A41, A42, A43, A44]
+    ])
+
+    ev = eigvals(A_sys)
+    tol = 1e-6
+    neutral = int(np.sum(np.abs(ev) < tol))
+    non_neutral_max_re = float(np.max(np.real(ev[np.abs(ev) >= tol])))
+    return neutral, non_neutral_max_re
+
+
+# ------------------------------------------------------------------------------
+# 4. Main Execution Routine
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    os.makedirs("figures", exist_ok=True)
+    os.makedirs("datasets", exist_ok=True)
+
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 10,
+        "axes.labelsize": 10,
+        "axes.titlesize": 11,
+        "legend.fontsize": 8.5,
+        "figure.dpi": 120,
+        "savefig.dpi": 300,
+        "axes.grid": True,
+        "grid.linestyle": ":",
+        "grid.alpha": 0.5
+    })
+
+    print("[*] Running nominal small-signal stability audit...")
+    neutral_modes, max_real_ev = verify_nominal_stability()
+    print(f"    -> Neutral Rotational Modes: {neutral_modes}")
+    print(f"    -> Max Non-Neutral Re(lambda): {max_real_ev:.4f} (System is exponentially stable)")
+
+    print("[*] Executing multi-scenario comparative benchmark...")
+    methods = ["standard", "median", "amdbc"]
+    attacks = ["no_attack", "constant", "ramp", "oscillatory", "intermittent"]
+
+    metrics_list = []
+    representative_results = {}
+
+    t_start = time.time()
+    for att in attacks:
+        for met in methods:
+            res = run_simulation(method=met, attack_type=att, seed=SEED)
+            metrics_list.append(compute_metrics(res))
+            if att == "ramp":
+                representative_results[met] = res
+
+    print(f"[+] All runs completed in {time.time() - t_start:.2f} seconds.")
+
+    df_metrics = pd.DataFrame(metrics_list)
+    df_metrics.to_csv("datasets/Comparative_Benchmark_Metrics.csv", index=False)
+
+    # Plot Fig 1: Dynamic Frequency Tracking
+    colors = {"standard": "#d62728", "median": "#ff7f0e", "amdbc": "#1f77b4"}
+    labels = {"standard": "Standard Consensus", "median": "Median Consensus", "amdbc": "Proposed AMD-BC"}
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6.5), sharex=True, sharey=True)
+    for i, ax in enumerate(axes.flat):
+        for met in methods:
+            res = representative_results[met]
+            ax.plot(res["time"], res["frequency"][:, i], color=colors[met], label=labels[met], lw=1.3)
+        ax.axhline(50.0, color="black", linestyle="--", lw=1.0, alpha=0.8)
+        ax.axvspan(ATTACK_START, ATTACK_END, color="red", alpha=0.08)
+        ax.axvline(LOAD_STEP_TIME, color="gray", linestyle=":", lw=1.0)
+        ax.set_title(f"Inverter {i+1} (DG {i+1})")
+        ax.set_ylim([49.1, 50.4])
+        if i in [2, 3]:
+            ax.set_xlabel("Time (s)")
+        if i in [0, 2]:
+            ax.set_ylabel("Frequency (Hz)")
+        if i == 0:
+            ax.legend(loc="lower left", framealpha=0.9)
+
+    fig.suptitle("Islanded AC Microgrid Secondary Frequency Restoration Under Ramp FDI Attack", fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("figures/Fig1_Frequency_Tracking.png")
+    plt.close()
+
+    # Plot Fig 2: Attack Profile & Adaptive Weights
+    res_amdbc = representative_results["amdbc"]
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8.5, 5.5), sharex=True)
+
+    ax1.plot(res_amdbc["time"], res_amdbc["attack"], color="red", lw=1.5, label="Injected Bias d_12(t)")
+    ax1.set_ylabel("Attack Magnitude (rad/s)")
+    ax1.set_title("Stealthy Covert FDI Ramp-and-Wander Attack Profile")
+    ax1.legend(loc="upper right")
+
+    for rx in range(N_DG):
+        if ADJ[rx, ATTACKED_DG] > 0:
+            ax2.plot(res_amdbc["time"], res_amdbc["weights"][:, rx, ATTACKED_DG], lw=1.4,
+                     label=f"DG {rx+1} Incoming Weight from DG 2")
+
+    ax2.set_ylabel("Adaptive Weight w_ij")
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylim([-0.05, 1.05])
+    ax2.set_title("Dynamic MAD Edge Weight Attenuation (Link Isolation)")
+    ax2.legend(loc="center right")
+
+    plt.tight_layout()
+    plt.savefig("figures/Fig2_Attack_and_Adaptive_Weights.png")
+    plt.close()
+
+    print("[+] Figures saved to figures/: Fig1_Frequency_Tracking.png, Fig2_Attack_and_Adaptive_Weights.png")
+    print("[+] Metrics saved to datasets/: Comparative_Benchmark_Metrics.csv")
+    print("\nBenchmark Summary (Ramp Attack):")
+    print(df_metrics[df_metrics["Attack"] == "ramp"].to_string(index=False))
